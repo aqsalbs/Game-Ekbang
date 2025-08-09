@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Action Builder — Game Pembangunan</title>
+<style>
+  :root{
+    --bg:#0f172a; --panel:#0b1220; --accent:#06b6d4; --good:#10b981; --bad:#ef4444; --muted:#94a3b8;
+  }
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Arial;background:linear-gradient(180deg,#071029 0%, #0f172a 100%);color:#e6eef6}
+  #gameWrap{max-width:1100px;margin:18px auto;padding:16px;}
+  header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+  header h1{font-size:20px;margin:0}
+  .controls{font-size:13px;color:var(--muted)}
+  canvas{display:block;background:#071028;border-radius:8px;width:100%;height:600px;box-shadow:0 6px 30px rgba(2,6,23,.6);}
+  .hud{display:flex;gap:12px;margin-top:10px;flex-wrap:wrap}
+  .card{background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.02));padding:10px;border-radius:8px;min-width:160px}
+  .card h3{margin:0 0 6px 0;font-size:13px;color:#cfeffd}
+  .bar{height:10px;background:rgba(255,255,255,.06);border-radius:6px;overflow:hidden}
+  .bar > i{display:block;height:100%;background:var(--accent)}
+  .btn{background:var(--accent);color:#032; padding:8px 10px;border-radius:6px;border:none;cursor:pointer}
+  .log{max-height:120px;overflow:auto;font-size:12px;color:#b9dfe6;}
+  footer{margin-top:10px;color:var(--muted);font-size:12px}
+  @media (max-width:720px){
+    canvas{height:480px}
+  }
+</style>
+</head>
+<body>
+  <div id="gameWrap">
+    <header>
+      <h1>Action Builder — Game Pembangunan (Prototype)</h1>
+      <div class="controls">Kontrol: ← → = Gerak • ↑/Space = Lompat • E = Kumpulkan/Bangun • P = Pause</div>
+    </header>
+
+    <canvas id="c"></canvas>
+
+    <div class="hud">
+      <div class="card">
+        <h3>Status Negara</h3>
+        <div>Tahun: <b id="yearDisp">1</b></div>
+        <div style="margin-top:6px">Development Score: <b id="devDisp">0</b> / <span id="devTarget">500</span></div>
+        <div style="margin-top:8px">Waktu tersisa: <span id="timeDisp">120</span>s</div>
+      </div>
+
+      <div class="card">
+        <h3>Sumber Daya</h3>
+        <div>Material: <b id="matDisp">0</b></div>
+        <div>Energi: <b id="engDisp">0</b></div>
+        <div>Uang: <b id="cashDisp">0</b></div>
+      </div>
+
+      <div class="card">
+        <h3>Bangunan (tekan E dekat construction)</h3>
+        <div>1. Road — cost: mat 5, cash 20 — +5 dev</div>
+        <div>2. Solar — cost: eng 10, cash 40 — +12 dev (ramah)</div>
+        <div>3. Factory — cost: mat 20, cash 80 — +25 dev (meningkatkan polusi)</div>
+      </div>
+
+      <div class="card" style="flex:1">
+        <h3>Log & Tips</h3>
+        <div class="log" id="log"></div>
+      </div>
+    </div>
+
+    <footer>Objective: Capai Development Score sebelum waktu habis. Bangun seimbang antara ekonomi & lingkungan.</footer>
+  </div>
+
+<script>
+/* ========= Action Builder — single-file JS game =========
+   - Canvas side-scroller playground
+   - Player moves, jumps, collects resource nodes
+   - Construction zone to place builds using resources
+   - Random hazards: pollution cloud, earthquake (damage)
+   - Development score increases by builds; some builds raise pollution (penalty)
+   - Simple game loop with physics and UI
+*/
+
+// Canvas & context
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+// Fit canvas to element CSS size
+function resizeCanvas(){ 
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.floor(rect.width * devicePixelRatio);
+  canvas.height = Math.floor(rect.height * devicePixelRatio);
+  ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+}
+window.addEventListener('resize', resizeCanvas);
+
+// Game state
+const state = {
+  paused: false,
+  time: 120, // seconds
+  year: 1,
+  devScore: 0,
+  devTarget: 500,
+  resources: { material: 0, energy: 0, cash: 100 },
+  player: { x: 80, y: 0, w: 28, h: 40, vx:0, vy:0, onGround:false },
+  gravity: 0.9,
+  nodes: [],       // resource nodes
+  hazards: [],     // hazards
+  builds: [],      // built structures
+  cameraX: 0,
+  widthWorld: 3000 // world length
+};
+
+// HUD elements
+const yearDisp = document.getElementById('yearDisp');
+const timeDisp = document.getElementById('timeDisp');
+const devDisp = document.getElementById('devDisp');
+const devTarget = document.getElementById('devTarget');
+const matDisp = document.getElementById('matDisp');
+const engDisp = document.getElementById('engDisp');
+const cashDisp = document.getElementById('cashDisp');
+const logEl = document.getElementById('log');
+
+devTarget.textContent = state.devTarget;
+
+// helper log
+function addLog(msg){
+  const p = document.createElement('div');
+  p.textContent = `[T${state.year}] ${msg}`;
+  logEl.prepend(p);
+  // cap log lines
+  while(logEl.childNodes.length > 60) logEl.removeChild(logEl.lastChild);
+}
+
+// initialize nodes randomly
+function spawnNodes(){
+  state.nodes = [];
+  for(let i=0;i<40;i++){
+    const x = 120 + Math.random()*(state.widthWorld-240);
+    const typeRoll = Math.random();
+    const type = typeRoll < 0.5 ? 'material' : (typeRoll < 0.8 ? 'energy' : 'cash');
+    state.nodes.push({ x, y: groundYAt(x) - 20, type, collected:false });
+  }
+}
+
+// simple ground function (flat with small hills)
+function groundYAt(x){
+  const base = canvas.height/ (devicePixelRatio || 1) - 100;
+  return base - 20*Math.sin(x/240) - 12*Math.cos(x/120);
+}
+
+// player controls
+const keys = {};
+window.addEventListener('keydown', e => {
+  if(e.key === 'p' || e.key === 'P'){ state.paused = !state.paused; e.preventDefault(); addLog(state.paused ? 'Game paused' : 'Game resumed'); }
+  keys[e.key] = true;
+});
+window.addEventListener('keyup', e => keys[e.key] = false);
+
+// simple camera follow
+function updateCamera(){
+  const margin = 180;
+  const left = state.cameraX + margin;
+  const right = state.cameraX + canvas.width / devicePixelRatio - margin;
+  if(state.player.x < left) state.cameraX = Math.max(0, state.player.x - margin);
+  if(state.player.x > right) state.cameraX = Math.min(state.widthWorld - canvas.width/devicePixelRatio, state.player.x + margin - canvas.width/devicePixelRatio);
+}
+
+// physics + input
+function updatePlayer(dt){
+  const p = state.player;
+  // input
+  const speed = 160 * dt;
+  if(keys['ArrowLeft'] || keys['a']) p.vx = -speed;
+  else if(keys['ArrowRight'] || keys['d']) p.vx = speed;
+  else p.vx = 0;
+
+  if((keys['ArrowUp'] || keys[' '] || keys['w']) && p.onGround){
+    p.vy = -13;
+    p.onGround = false;
+  }
+
+  // apply gravity
+  p.vy += state.gravity * dt * 60;
+  p.x += p.vx;
+  p.y += p.vy;
+
+  // ground collision
+  const gy = groundYAt(p.x);
+  if(p.y + p.h/2 >= gy){
+    p.y = gy - p.h/2;
+    p.vy = 0;
+    p.onGround = true;
+  }
+
+  // clamp to world
+  p.x = Math.max(20, Math.min(state.widthWorld-20, p.x));
+}
+
+// collect nodes if near and press E
+function collectResources(){
+  const p = state.player;
+  for(const node of state.nodes){
+    if(node.collected) continue;
+    const dx = Math.abs(node.x - p.x);
+    const dy = Math.abs(node.y - p.y);
+    if(dx < 30 && dy < 30 && (keys['e'] || keys['E'])){
+      node.collected = true;
+      if(node.type === 'material') { state.resources.material += 3; addLog('Mengumpulkan material +3'); }
+      if(node.type === 'energy')   { state.resources.energy += 2; addLog('Mengumpulkan energi +2'); }
+      if(node.type === 'cash')     { state.resources.cash += 25; addLog('Mendapatkan uang +25'); }
+    }
+  }
+}
+
+// attempt to build if near construction point
+const constructionX = 60; // fixed left area as 'capital/construction area'
+function tryBuild(){
+  const p = state.player;
+  const dx = Math.abs(p.x - constructionX);
+  if(dx < 60 && (keys['e'] || keys['E'])){
+    // show a quick menu based on keys 1-3
+    if(keys['1']){
+      // Road: mat5 cash20
+      if(state.resources.material >= 5 && state.resources.cash >= 20){
+        state.resources.material -=5; state.resources.cash -=20; state.devScore +=5;
+        state.builds.push({type:'road', x:constructionX, y:groundYAt(constructionX)-10});
+        addLog('Membangun Road (+5 dev)');
+      } else addLog('Tidak cukup resource untuk Road');
+    } else if(keys['2']){
+      // Solar: eng10 cash40
+      if(state.resources.energy >=10 && state.resources.cash >=40){
+        state.resources.energy -=10; state.resources.cash -=40; state.devScore +=12;
+        state.builds.push({type:'solar', x:constructionX+30, y:groundYAt(constructionX)-10});
+        addLog('Membangun Solar (+12 dev, bersih)');
+      } else addLog('Tidak cukup resource untuk Solar');
+    } else if(keys['3']){
+      // Factory: mat20 cash80, increases pollution
+      if(state.resources.material >=20 && state.resources.cash >=80){
+        state.resources.material -=20; state.resources.cash -=80; state.devScore +=25;
+        state.builds.push({type:'factory', x:constructionX+60, y:groundYAt(constructionX)-10, pollution:10});
+        addLog('Membangun Factory (+25 dev, polusi naik)');
+      } else addLog('Tidak cukup resource untuk Factory');
+    }
+  }
+}
+
+// hazards spawn: pollution cloud drifts rightwards, earthquake is instantaneous
+function spawnHazard(){
+  const roll = Math.random();
+  if(roll < 0.2){
+    // small pollution cloud at random x near factories
+    const factList = state.builds.filter(b => b.type === 'factory');
+    if(factList.length){
+      const f = factList[Math.floor(Math.random()*factList.length)];
+      state.hazards.push({type:'pollution', x: f.x + 40 + Math.random()*80, y: groundYAt(f.x)-60, life: 8, vx: 25});
+      addLog('Polusi muncul dari Factory!');
+    }
+  } else if(roll < 0.28){
+    // earthquake affects all: destroy some builds or reduce dev
+    addLog('Gempa! Beberapa bangunan rusak.');
+    // remove random build
+    if(state.builds.length){
+      const idx = Math.floor(Math.random()*state.builds.length);
+      const removed = state.builds.splice(idx,1)[0];
+      state.devScore = Math.max(0, state.devScore - 8);
+      addLog(`${removed.type} rusak akibat gempa (-8 dev)`);
+    }
+  }
+}
+
+// update hazards
+function updateHazards(dt){
+  for(const h of state.hazards){
+    if(h.type === 'pollution'){
+      h.x += h.vx * dt;
+      h.life -= dt;
+      // if player in cloud -> reduce energy and dev growth temporarily
+      const p = state.player;
+      if(Math.abs(h.x - p.x) < 40 && Math.abs(h.y - p.y) < 40){
+        // penalty: slow dev accumulation by marking a small cash penalty over time
+        if(Math.random() < 0.01) { state.resources.energy = Math.max(0, state.resources.energy - 1); }
+      }
+    }
+  }
+  // remove dead
+  state.hazards = state.hazards.filter(h => h.life > 0 && h.x < state.widthWorld);
+}
+
+// main update loop
+let last = performance.now();
+let hazardTimer = 0;
+function update(now){
+  const dt = Math.min(0.033, (now - last)/1000);
+  last = now;
+  if(!state.paused){
+    // countdown time
+    state.time -= dt;
+    if(state.time <= 0) endGame();
+    // player physics & control
+    updatePlayer(dt);
+    // camera
+    updateCamera();
+    // collect resources
+    collectResources();
+    // build attempts (E+1/2/3)
+    tryBuild();
+    // hazards spawn occasionally
+    hazardTimer += dt;
+    if(hazardTimer > 6){
+      spawnHazard();
+      hazardTimer = 0;
+    }
+    updateHazards(dt);
+    // small passive income from built factories/roads
+    state.resources.cash += (state.builds.filter(b=>b.type==='factory').length * 0.02);
+    // update year occasionally when time threshold cross
+    if(Math.floor(state.time) % 30 === 0){
+      // nothing specific, but we can bump year at certain times
+    }
+    // update UI fields
+    yearDisp.textContent = state.year;
+    timeDisp.textContent = Math.max(0,Math.floor(state.time));
+    devDisp.textContent = state.devScore;
+    matDisp.textContent = state.resources.material;
+    engDisp.textContent = state.resources.energy;
+    cashDisp.textContent = Math.floor(state.resources.cash);
+  }
+
+  render();
+  requestAnimationFrame(update);
+}
+
+// render world
+function render(){
+  const w = canvas.width / devicePixelRatio;
+  const h = canvas.height / devicePixelRatio;
+  // clear
+  ctx.fillStyle = "#071028";
+  ctx.fillRect(0,0,w,h);
+
+  // sky gradient
+  const g = ctx.createLinearGradient(0,0,0,h);
+  g.addColorStop(0,'#0a1a2b'); g.addColorStop(1,'#071028');
+  ctx.fillStyle = g; ctx.fillRect(0,0,w/3,h/2);
+
+  // draw ground across
+  ctx.fillStyle = '#123344';
+  const step = 6;
+  ctx.beginPath();
+  ctx.moveTo(0,h);
+  for(let sx=0;sx<w;sx+=step){
+    const worldX = state.cameraX + sx;
+    const gy = groundYAt(worldX);
+    ctx.lineTo(sx, gy);
+  }
+  ctx.lineTo(w,h); ctx.closePath(); ctx.fill();
+
+  // draw nodes
+  for(const node of state.nodes){
+    if(node.collected) continue;
+    const sx = node.x - state.cameraX;
+    const sy = node.y;
+    if(sx < -50 || sx > w+50) continue;
+    if(node.type === 'material') ctx.fillStyle = '#eab308';
+    else if(node.type === 'energy') ctx.fillStyle = '#f97316';
+    else ctx.fillStyle = '#60a5fa';
+    ctx.beginPath(); ctx.arc(sx, sy, 8,0,Math.PI*2); ctx.fill();
+    // icon
+    ctx.fillStyle = '#021826'; ctx.font='10px Arial'; ctx.textAlign='center';
+    ctx.fillText(node.type[0].toUpperCase(), sx, sy+3);
+  }
+
+  // draw builds
+  for(const b of state.builds){
+    const sx = b.x - state.cameraX;
+    const sy = b.y;
+    if(sx < -100 || sx > w+100) continue;
+    if(b.type === 'road'){
+      ctx.fillStyle = '#6b7280';
+      ctx.fillRect(sx-30, sy, 60, 8);
+    } else if(b.type === 'solar'){
+      ctx.fillStyle = '#f59e0b';
+      ctx.fillRect(sx-18, sy-14, 36, 10);
+    } else if(b.type === 'factory'){
+      ctx.fillStyle = '#374151';
+      ctx.fillRect(sx-26, sy-30, 52, 28);
+      // smoke
+      ctx.fillStyle = 'rgba(80,80,80,0.7)';
+      ctx.beginPath(); ctx.arc(sx+6, sy-36, 8,0,Math.PI*2); ctx.fill();
+    }
+  }
+
+  // draw hazards (pollution)
+  for(const h of state.hazards){
+    const sx = h.x - state.cameraX;
+    const sy = h.y;
+    ctx.fillStyle = 'rgba(120,90,90,0.25)';
+    ctx.beginPath(); ctx.ellipse(sx, sy, 40, 20, 0,0,Math.PI*2); ctx.fill();
+  }
+
+  // draw player
+  const px = state.player.x - state.cameraX;
+  const py = state.player.y - state.player.h/2;
+  ctx.fillStyle = '#7dd3fc';
+  ctx.fillRect(px - state.player.w/2, py, state.player.w, state.player.h);
+  // face
+  ctx.fillStyle = '#021826';
+  ctx.fillRect(px-6, py+8, 4,4);
+
+  // HUD overlay small indicators
+  ctx.fillStyle = '#ffffffaa';
+  ctx.font = '12px Arial';
+  ctx.textAlign = 'left';
+  ctx.fillText('Press E + (1/2/3) near left to build', 10, 18);
+}
+
+// end game (when time over or reached target)
+function endGame(){
+  state.paused = true;
+  if(state.devScore >= state.devTarget){
+    addLog('Selamat! Target pembangunan tercapai — kamu menang!');
+    alert('Menang! Target pembangunan tercapai 🎉');
+  } else {
+    addLog('Waktu habis. Game over — target tidak tercapai.');
+    alert('Game Over — Target tidak tercapai.');
+  }
+}
+
+// Setup initial
+resizeCanvas();
+spawnNodes();
+addLog('Selamat datang — kumpulkan resource dan bangun infrastruktur!\nTips: Dekat area kiri tekan E lalu 1/2/3 untuk membangun.');
+
+// Start loop
+requestAnimationFrame(update);
+
+</script>
+</body>
+</html>
